@@ -44,7 +44,7 @@ class MockAssemblyAI:
             event_type = data.get("type")
             
             if event_type == "session.update":
-                greeting = data.get("session", {}).get("greeting", "OpsVoice AI Incident Commander online.")
+                greeting = data.get("session", {}).get("greeting", "OpsVoice AI Incident Commander online. Ready to inspect cluster health or restart failed services.")
                 self.recv_queue.put(json.dumps({
                     "type": "transcript.agent",
                     "text": greeting
@@ -123,6 +123,12 @@ app = Flask(__name__)
 # Enable CORS for Next.js frontend (typically running on port 3000)
 CORS(app)
 
+# Configure WebSocket server options for persistent connections and ping intervals
+app.config['SOCK_SERVER_OPTIONS'] = {
+    'ping_interval': 25,
+    'max_message_size': 10 * 1024 * 1024
+}
+
 # Initialize Flask-Sock for WebSockets
 sock = Sock(app)
 
@@ -171,9 +177,8 @@ def agent_websocket(ws):
     Handles tool calls from the voice agent, runs them on the mock cluster state,
     and returns tool results dynamically.
     """
-    # Log incoming connection origin
     origin = request.headers.get('Origin')
-    print(f"[OpsVoice Backend] WebSocket connection received from origin: {origin}")
+    print(f"[OpsVoice Backend] WebSocket connection established from origin: {origin}")
 
     api_key = os.environ.get("ASSEMBLYAI_API_KEY")
     aai_ws = None
@@ -192,7 +197,24 @@ def agent_websocket(ws):
         aai_ws = MockAssemblyAI()
         
     connection_active = True
-    
+    send_lock = threading.Lock()
+
+    def safe_ws_send(payload):
+        """Thread-safe WebSocket send wrapper."""
+        if not connection_active:
+            return False
+        with send_lock:
+            try:
+                if getattr(ws, 'connected', True):
+                    ws.send(payload)
+                    return True
+                return False
+            except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError):
+                return False
+            except Exception as send_err:
+                print(f"[OpsVoice Backend] Error in safe_ws_send: {send_err}")
+                return False
+
     def handle_assemblyai_stream():
         nonlocal connection_active
         try:
@@ -250,7 +272,7 @@ def agent_websocket(ws):
                     aai_ws.send(json.dumps(result_msg))
                     
                     # Broadcast execution updates to frontend (updates metrics cards and SRE logs)
-                    ws.send(json.dumps({
+                    safe_ws_send(json.dumps({
                         "type": "tool.execution",
                         "tool_call": {
                             "id": call_id,
@@ -263,16 +285,13 @@ def agent_websocket(ws):
                     continue
                 
                 # Forward transcripts, TTS voice data, and speech boundaries to browser
-                ws.send(msg)
+                safe_ws_send(msg)
                 
         except Exception as e:
-            print(f"[OpsVoice Backend] Error in AssemblyAI listener thread: {e}")
+            if connection_active:
+                print(f"[OpsVoice Backend] AssemblyAI listener thread exception: {e}")
         finally:
             connection_active = False
-            try:
-                ws.close()
-            except Exception:
-                pass
 
     # Start the AssemblyAI listener thread to process async responses in parallel
     listener_thread = threading.Thread(target=handle_assemblyai_stream)
@@ -283,10 +302,13 @@ def agent_websocket(ws):
     try:
         while connection_active:
             try:
-                client_msg = ws.receive()
+                client_msg = ws.receive(timeout=1.0)
                 if client_msg is None:
-                    print("[OpsVoice Backend] Client connection closed cleanly (received None).")
-                    break
+                    # Timeout reached; verify if socket is still open and continue
+                    if not getattr(ws, 'connected', True):
+                        print("[OpsVoice Backend] Client connection closed.")
+                        break
+                    continue
                     
                 # If receiving raw binary PCM audio bytes, encapsulate as AssemblyAI audio packet
                 if isinstance(client_msg, bytes):
@@ -297,12 +319,9 @@ def agent_websocket(ws):
                         "audio": b64_pcm
                     }))
                 else:
-                    # Handle plain text pings (common in initial connection / handshake checks)
+                    # Handle plain text pings (common in connection / handshake checks)
                     if client_msg in ("ping", "__ping__", "keepalive"):
-                        try:
-                            ws.send("pong")
-                        except Exception as send_err:
-                            print(f"[OpsVoice Backend] Failed to send pong: {send_err}")
+                        safe_ws_send("pong")
                         continue
                     
                     try:
@@ -311,36 +330,33 @@ def agent_websocket(ws):
                         
                         # If receiving a JSON ping/heartbeat, handle it locally
                         if isinstance(data, dict) and data.get("type") in ("ping", "heartbeat"):
-                            try:
-                                ws.send(json.dumps({"type": "pong"}))
-                            except Exception as send_err:
-                                print(f"[OpsVoice Backend] Failed to send JSON pong: {send_err}")
+                            safe_ws_send(json.dumps({"type": "pong"}))
                             continue
                             
                         # Forward other controls to AssemblyAI
                         aai_ws.send(client_msg)
                     except ValueError:
-                        # Log non-JSON string message but do not raise/crash/terminate
                         print(f"[OpsVoice Backend] Non-JSON string received and ignored: {client_msg}")
-            except (ConnectionClosed, ConnectionResetError, BrokenPipeError) as ce:
+            except (ConnectionClosed, ConnectionResetError, BrokenPipeError, OSError) as ce:
                 print(f"[OpsVoice Backend] Client connection terminated: {ce}")
                 break
             except Exception as e:
-                print(f"[OpsVoice Backend] Error processing client message: {e}")
-                import traceback
-                traceback.print_exc()
-                # Stop loop if the client socket itself is no longer connected
                 if not getattr(ws, 'connected', True):
-                    print("[OpsVoice Backend] WebSocket client is no longer connected. Exiting loop.")
                     break
+                print(f"[OpsVoice Backend] Error processing client message: {e}")
     finally:
         connection_active = False
         try:
             aai_ws.close()
         except Exception:
             pass
+        try:
+            if getattr(ws, 'connected', True):
+                ws.close(1000, "Normal closure")
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     port = int(os.environ.get("FLASK_PORT", 5000))
-    # Run server locally (host '0.0.0.0' for docker/network access)
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Run server locally with threaded request handling
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

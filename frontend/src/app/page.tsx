@@ -231,12 +231,14 @@ export default function SREDashboard() {
           addLog("system", "🟢 COMMANDER: OpsVoice AI Incident Commander Online");
         }
       } else if (status === "disconnected") {
-        connectionLoggedRef.current = false;
-        addLog("system", "🔴 COMMANDER: Connection closed. Session terminated.");
+        if (connectionLoggedRef.current) {
+          connectionLoggedRef.current = false;
+          addLog("system", "🔴 COMMANDER: Connection closed. Session terminated.");
+        }
       } else if (status === "connecting") {
         if (err && err.includes("Reconnecting")) {
           addLog("system", "🔄 CONNECTION LOST: Unexpected disconnection. Reconnecting in 3 seconds...");
-        } else {
+        } else if (!connectionLoggedRef.current) {
           addLog("system", "🔄 COMMANDER: Connecting to ws://127.0.0.1:5000/ws/agent...");
         }
       } else if (status === "error") {
